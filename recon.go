@@ -501,16 +501,22 @@ func (c *Ctx) request(method, path string, headers map[string]string, body strin
 		}
 		u := rawURL.String()
 		if !rawURL.IsAbs() {
-			u = strings.TrimRight(c.Base, "/") + "/" + strings.TrimLeft(curPath, "/")
-			rawURL, err = url.Parse(u)
+			// Relative module paths stay beneath the user-authorized target path.
+			scopeBase, err := url.Parse(strings.TrimRight(c.Base, "/") + strings.TrimRight(c.ScopePath, "/") + "/")
 			if err != nil {
 				return nil, ""
 			}
+			rawURL, err = url.Parse(strings.TrimLeft(curPath, "/"))
+			if err != nil {
+				return nil, ""
+			}
+			rawURL = scopeBase.ResolveReference(rawURL)
+			u = rawURL.String()
 		}
 		if !strings.EqualFold(rawURL.Scheme, "http") && !strings.EqualFold(rawURL.Scheme, "https") {
 			return nil, ""
 		}
-		if !allowExternal && !c.isTargetURL(rawURL) {
+		if !allowExternal && (!c.isTargetURL(rawURL) || !c.inScope(rawURL.String())) {
 			return nil, ""
 		}
 		if c.Args.Delay > 0 {
@@ -568,22 +574,32 @@ func (c *Ctx) req(method, path string, headers map[string]string, body string, c
 	return c.request(method, path, headers, body, ct, follow, false)
 }
 
-// workerPool runs fn for each item in tasks using up to threads goroutines.
+// workerPool runs fn with a fixed number of workers, avoiding one goroutine per task.
 func workerPool[T any](tasks []T, threads int, fn func(T)) {
 	if threads <= 0 {
 		threads = 1
 	}
-	sem := make(chan struct{}, threads)
-	var wg sync.WaitGroup
-	for _, t := range tasks {
-		wg.Add(1)
-		go func(item T) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			fn(item)
-		}(t)
+	if threads > len(tasks) {
+		threads = len(tasks)
 	}
+	if threads == 0 {
+		return
+	}
+	jobs := make(chan T)
+	var wg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range jobs {
+				fn(item)
+			}
+		}()
+	}
+	for _, task := range tasks {
+		jobs <- task
+	}
+	close(jobs)
 	wg.Wait()
 }
 
@@ -1385,7 +1401,8 @@ func runCORS(c *Ctx) {
 				fmt.Sprintf("Origin: %s\nACAO: %s", t.origin, a), "")
 		} else if a == "*" {
 			if creds {
-				c.addF("cors", "CORS wildcard+creds: "+t.path, "HIGH", "ACAO: * with credentials", "")
+				c.addF("cors", "CORS wildcard with credentials: "+t.path, "INFO",
+					"ACAO: * with ACAC: true. Browsers reject wildcard origins for credentialed CORS requests; verify server intent.", "")
 			} else {
 				c.addF("cors", "CORS wildcard: "+t.path, "INFO", "ACAO: *", "")
 			}
@@ -1657,6 +1674,9 @@ func runSSRF(c *Ctx) {
 
 func runGraphQL(c *Ctx) {
 	c.phase("GRAPHQL")
+	if !requireActive(c, "graphql", "GraphQL POST introspection") {
+		return
+	}
 	var gURL string
 	for _, p := range []string{"/graphql", "/graphiql", "/api/graphql", "/query"} {
 		r, _ := c.post(p, nil, `{"query":"{ __schema { queryType { name } mutationType { name } types { name kind fields { name } } } }"}`, "application/json")
@@ -2086,7 +2106,14 @@ func runSubdomain(c *Ctx) {
 	c.addF("subdomain", fmt.Sprintf("Discovered %d subdomains via crt.sh", len(subList)), "INFO",
 		strings.Join(subList[:min(25, len(subList))], ", "), "")
 
-	// Probe liveness of discovered subdomains
+	// Probe a bounded number of discovered subdomains to avoid an unbounded
+	// external workload for domains with large certificate histories.
+	const maxSubdomainProbes = 500
+	probeList := subList[:min(maxSubdomainProbes, len(subList))]
+	if len(subList) > len(probeList) {
+		c.addF("subdomain", fmt.Sprintf("Subdomain liveness probes capped at %d", len(probeList)), "INFO",
+			fmt.Sprintf("Discovered: %d; probing first %d sorted entries", len(subList), len(probeList)), "")
+	}
 	var liveSubs []string
 	var liveMu sync.Mutex
 	probeSub := func(sub string) {
@@ -2100,7 +2127,7 @@ func runSubdomain(c *Ctx) {
 			liveMu.Unlock()
 		}
 	}
-	workerPool(subList, min(c.Args.Threads, 15), probeSub)
+	workerPool(probeList, min(c.Args.Threads, 15), probeSub)
 
 	if len(liveSubs) > 0 {
 		c.addF("subdomain", fmt.Sprintf("Live subdomains: %d/%d", len(liveSubs), len(subList)), "LOW",
@@ -2513,44 +2540,9 @@ func runRCE(c *Ctx) {
 		return
 	}
 	ensureCrawled(c)
-	echoMarker := "dfrce_" + c.rand(6)
-	cmdPayloads := []string{
-		";echo " + echoMarker + ";",
-		"|echo " + echoMarker,
-		"&echo " + echoMarker + "&",
-		"`echo " + echoMarker + "`",
-		"$(echo " + echoMarker + ")",
-	}
-
-	// 1. Echo reflection probe
-	for _, pg := range c.Crawled {
-		pu, _ := url.Parse(pg.URL)
-		qs := pu.Query()
-		if len(qs) == 0 {
-			continue
-		}
-		for pm := range qs {
-			for _, pl := range cmdPayloads {
-				fq := url.Values{}
-				for k, vs := range qs {
-					for _, v := range vs {
-						fq.Add(k, v)
-					}
-				}
-				fq.Set(pm, pl)
-				fu := pu.Scheme + "://" + pu.Host + pu.Path + "?" + fq.Encode()
-				r, b := c.get(fu, nil)
-				if r != nil && strings.Contains(b, echoMarker) {
-					c.addF("rce", "OS Command Injection (Echo Reflected): ?"+pm, "CRITICAL",
-						fmt.Sprintf("URL: %s\nParam: %s\nPayload: %s\nReflected Marker: %s", fu, pm, pl, echoMarker),
-						fmt.Sprintf("curl -isk '%s'", fu))
-					break
-				}
-			}
-		}
-	}
-
-	// 2. Active time-delay probe
+	// Timing variation alone is not proof of command execution. This module
+	// reports only an inconclusive anomaly for manual, authorized verification.
+	// Active time-delay probe:
 	if c.Args.Active {
 		timePayloads := []string{";sleep 3.5;", "&timeout /t 4&"}
 		for _, pg := range c.Crawled[:min(3, len(c.Crawled))] {
@@ -2574,8 +2566,8 @@ func runRCE(c *Ctx) {
 					r, _ := c.get(fu, nil)
 					dur := time.Since(st1).Seconds()
 					if r != nil && dur >= baseDur+3.0 {
-						c.addF("rce", "Time-based Command Injection: ?"+pm, "CRITICAL",
-							fmt.Sprintf("URL: %s\nParam: %s\nPayload: %s\nBaseline: %.2fs -> Delay: %.2fs", fu, pm, tpl, baseDur, dur),
+						c.addF("rce", "Timing anomaly after command-like input: ?"+pm, "INFO",
+							fmt.Sprintf("URL: %s\nParam: %s\nInput: %s\nBaseline: %.2fs -> Delay: %.2fs\nTiming alone does not confirm command execution.", fu, pm, tpl, baseDur, dur),
 							fmt.Sprintf("curl -isk '%s'", fu))
 						break
 					}
@@ -2604,8 +2596,8 @@ func runXXE(c *Ctx) {
 			continue
 		}
 		if strings.Contains(b, marker) {
-			c.addF("xxe", "XXE entity expansion confirmed: "+ep, "CRITICAL",
-				fmt.Sprintf("Endpoint: %s\nMarker reflected: %s\nResponse: %s", ep, marker, trunc(b, 200)),
+			c.addF("xxe", "XML entity marker reflected: "+ep, "INFO",
+				fmt.Sprintf("Endpoint: %s\nMarker reflected: %s\nResponse: %s\nReflection does not confirm external entity resolution.", ep, marker, trunc(b, 200)),
 				fmt.Sprintf("curl -isk -X POST '%s%s' -H 'Content-Type: application/xml' -d '%s'", c.Base, ep, xxePayload))
 		} else if strings.Contains(strings.ToLower(b), "xml") && (r.StatusCode == 200 || r.StatusCode == 400 || r.StatusCode == 500) {
 			for _, xmlErr := range []string{"entity", "doctype", "parsererror", "saxexception", "xmlstreamexception"} {
@@ -3158,6 +3150,10 @@ func main() {
 	flag.StringVar(&a.Diff, "diff", "", "Previous scan dir for diff")
 	flag.Var(&a.Headers, "H", "Custom header (repeatable, e.g. -H 'Authorization: Bearer ...')")
 	flag.Parse()
+	if a.Threads < 1 {
+		fmt.Println("Error: -threads must be at least 1")
+		os.Exit(1)
+	}
 	if a.URL == "" {
 		fmt.Println("Error: -u required")
 		os.Exit(1)
@@ -3184,12 +3180,12 @@ func main() {
 		os.Exit(1)
 	}
 	c.Target = nu
-	c.Host = strings.Split(p.Host, ":")[0]
+	c.Host = p.Hostname()
 	c.Base = fmt.Sprintf("%s://%s", p.Scheme, p.Host)
 	c.TargetScheme = p.Scheme
 	c.TargetAuthority = p.Host
 	c.TargetPort = effectivePort(p)
-	c.ScopePath = p.EscapedPath()
+	c.ScopePath = strings.TrimRight(p.EscapedPath(), "/")
 	if c.ScopePath == "" {
 		c.ScopePath = "/"
 	}

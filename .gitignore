@@ -1,0 +1,44 @@
+# Build artifacts
+*.exe
+*.out
+*.test
+/bin/
+/dist/
+
+# Scan output and potentially sensitive evidence
+result/
+*/result/
+**/result/
+127.0.0.1/
+result.zip
+*_loader.*
+*.bak
+report*.html
+report*.json
+report*.sarif
+full_output.txt
+nmap.txt
+nuclei.txt
+httpx.txt
+*.jsonl
+logs/
+loot/
+poc/
+intelligent_wordlist.txt
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+id_rsa*
+credentials.*
+secrets.*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
